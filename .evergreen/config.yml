@@ -350,6 +350,23 @@ functions:
             chmod +x $i
           done
 
+  assume-ec2-role:
+    - command: ec2.assume_role
+      params:
+        role_arn: ${aws_test_secrets_role}
+
+  run-oidc-auth-test-with-test-credentials:
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src/go.mongodb.org/mongo-driver
+        shell: bash
+        include_expansions_in_env: ["DRIVERS_TOOLS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+        script: |
+          ${PREPARE_SHELL}
+          export OIDC="oidc"
+          bash ${PROJECT_DIRECTORY}/etc/run-oidc-test.sh 'make -s evg-test-oidc-auth'
+
   run-make:
     - command: shell.exec
       type: test
@@ -1954,6 +1971,35 @@ tasks:
             popd
             ./.evergreen/run-deployed-lambda-aws-tests.sh
 
+  - name: "oidc-auth-test-latest"
+    commands:
+      - func: "run-oidc-auth-test-with-test-credentials"
+
+  - name: "oidc-auth-test-azure-latest"
+    commands:
+    - command: shell.exec
+      params:
+        working_dir: src/go.mongodb.org/mongo-driver
+        shell: bash
+        script: |-
+          set -o errexit
+          ${PREPARE_SHELL}
+          export AZUREOIDC_DRIVERS_TAR_FILE=/tmp/mongo-go-driver.tar.gz
+          # we need to statically link libc to avoid the situation where the VM has a different
+          # version of libc
+          go build -tags osusergo,netgo -ldflags '-w -extldflags "-static -lgcc -lc"' -o test ./cmd/testoidcauth/main.go
+          rm "$AZUREOIDC_DRIVERS_TAR_FILE" || true
+          tar -cf $AZUREOIDC_DRIVERS_TAR_FILE ./test
+          tar -uf $AZUREOIDC_DRIVERS_TAR_FILE ./etc
+          rm "$AZUREOIDC_DRIVERS_TAR_FILE".gz || true
+          gzip $AZUREOIDC_DRIVERS_TAR_FILE
+          export AZUREOIDC_DRIVERS_TAR_FILE=/tmp/mongo-go-driver.tar.gz
+          # Define the command to run on the azure VM.
+          # Ensure that we source the environment file created for us, set up any other variables we need,
+          # and then run our test suite on the vm.
+          export AZUREOIDC_TEST_CMD="PROJECT_DIRECTORY='.' OIDC_ENV=azure OIDC=oidc ./etc/run-oidc-test.sh ./test"
+          bash $DRIVERS_TOOLS/.evergreen/auth_oidc/azure/run-driver-test.sh
+
   - name: "test-search-index"
     commands:
       - func: "bootstrap-mongo-orchestration"
@@ -2014,7 +2060,7 @@ axes:
       - id: "windows-64-go-1-20"
         display_name: "Windows 64-bit"
         run_on:
-          - windows-vsCurrent-latest-small
+          - windows-vsCurrent-small
         variables:
           GCC_PATH: "/cygdrive/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin"
           GO_DIST: "C:\\golang\\go1.20"
@@ -2038,7 +2084,7 @@ axes:
       - id: "windows-64-go-1-20"
         display_name: "Windows 64-bit"
         run_on:
-          - windows-vsCurrent-latest-small
+          - windows-vsCurrent-small
         variables:
           GCC_PATH: "/cygdrive/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin"
           GO_DIST: "C:\\golang\\go1.20"
@@ -2070,7 +2116,7 @@ axes:
       - id: "windows-64-vsCurrent-latest-small-go-1-20"
         display_name: "Windows 64-bit"
         run_on:
-          - windows-vsCurrent-latest-small
+          - windows-vsCurrent-small
         variables:
           GCC_PATH: "/cygdrive/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin"
           GO_DIST: "C:\\golang\\go1.20"
@@ -2247,6 +2293,55 @@ task_groups:
     tasks:
       - testazurekms-task
 
+  - name: testoidc_task_group
+    setup_group:
+      - func: fetch-source
+      - func: prepare-resources
+      - func: fix-absolute-paths
+      - func: make-files-executable
+      - func: assume-ec2-role
+      - command: shell.exec
+        params:
+          shell: bash
+          include_expansions_in_env: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+          script: |
+            ${PREPARE_SHELL}
+            ${DRIVERS_TOOLS}/.evergreen/auth_oidc/setup.sh
+    teardown_task:
+      - command: subprocess.exec
+        params:
+          binary: bash
+          args:
+            - ${DRIVERS_TOOLS}/.evergreen/auth_oidc/teardown.sh
+    setup_group_can_fail_task: true
+    setup_group_timeout_secs: 1800
+    tasks:
+      - oidc-auth-test-latest
+
+  - name: testazureoidc_task_group
+    setup_group:
+      - func: fetch-source
+      - func: prepare-resources
+      - func: fix-absolute-paths
+      - func: make-files-executable
+      - command: subprocess.exec
+        params:
+          binary: bash
+          env:
+            AZUREOIDC_VMNAME_PREFIX: "GO_DRIVER"
+          args:
+            - ${DRIVERS_TOOLS}/.evergreen/auth_oidc/azure/create-and-setup-vm.sh
+    teardown_task:
+      - command: subprocess.exec
+        params:
+          binary: bash
+          args:
+            - ${DRIVERS_TOOLS}/.evergreen/auth_oidc/azure/delete-vm.sh
+    setup_group_can_fail_task: true
+    setup_group_timeout_secs: 1800
+    tasks:
+      - oidc-auth-test-azure-latest
+
   - name: test-aws-lambda-task-group
     setup_group:
       - func: fetch-source
@@ -2391,23 +2486,48 @@ buildvariants:
     tasks:
       - name: "test-docker-runner"
 
-  - matrix_name: "tests-36-with-zlib-support"
+  - matrix_name: "tests-rhel-36-with-zlib-support"
     tags: ["pullrequest"]
-    matrix_spec: { version: ["3.6"], os-ssl-32: ["windows-64-go-1-20", "rhel87-64-go-1-20"] }
+    matrix_spec: { version: ["3.6"], os-ssl-32: ["rhel87-64-go-1-20"] }
     display_name: "${version} ${os-ssl-32}"
     tasks:
       - name: ".test !.enterprise-auth !.snappy !.zstd"
 
-  - matrix_name: "tests-40-with-zlib-support"
+  - matrix_name: "tests-windows-36-with-zlib-support"
+    matrix_spec: { version: ["3.6"], os-ssl-32: ["windows-64-go-1-20"] }
+    display_name: "${version} ${os-ssl-32}"
+    tasks:
+      - name: ".test !.enterprise-auth !.snappy !.zstd"
+
+  - matrix_name: "tests-rhel-40-with-zlib-support"
     tags: ["pullrequest"]
-    matrix_spec: { version: ["4.0"], os-ssl-40: ["windows-64-go-1-20", "rhel87-64-go-1-20"] }
+    matrix_spec: { version: ["4.0"], os-ssl-40: ["rhel87-64-go-1-20"] }
     display_name: "${version} ${os-ssl-40}"
     tasks:
       - name: ".test !.enterprise-auth !.snappy !.zstd"
 
-  - matrix_name: "tests-42-plus-zlib-zstd-support"
+  - matrix_name: "tests-windows-40-with-zlib-support"
+    matrix_spec: { version: ["4.0"], os-ssl-40: ["windows-64-go-1-20"] }
+    display_name: "${version} ${os-ssl-40}"
+    tasks:
+      - name: ".test !.enterprise-auth !.snappy !.zstd"
+
+  - matrix_name: "tests-rhel-42-plus-zlib-zstd-support"
     tags: ["pullrequest"]
-    matrix_spec: { version: ["4.2", "4.4", "5.0", "6.0", "7.0", "8.0"], os-ssl-40: ["windows-64-go-1-20", "rhel87-64-go-1-20"] }
+    matrix_spec: { version: ["4.2", "4.4", "5.0", "6.0", "7.0", "8.0"], os-ssl-40: ["rhel87-64-go-1-20"] }
+    display_name: "${version} ${os-ssl-40}"
+    tasks:
+      - name: ".test !.enterprise-auth !.snappy"
+
+  - matrix_name: "tests-windows-42-plus-zlib-zstd-support"
+    matrix_spec: { version: ["4.2", "4.4", "5.0", "6.0", "7.0"], os-ssl-40: ["windows-64-go-1-20"] }
+    display_name: "${version} ${os-ssl-40}"
+    tasks:
+      - name: ".test !.enterprise-auth !.snappy"
+
+  - matrix_name: "tests-windows-80-zlib-zstd-support"
+    tags: ["pullrequest"]
+    matrix_spec: { version: ["8.0"], os-ssl-40: ["windows-64-go-1-20"] }
     display_name: "${version} ${os-ssl-40}"
     tasks:
       - name: ".test !.enterprise-auth !.snappy"
@@ -2561,3 +2681,15 @@ buildvariants:
       - name: testazurekms_task_group
         batchtime: 20160 # Use a batchtime of 14 days as suggested by the CSFLE test README
       - testazurekms-fail-task
+
+  - name: testoidc-variant
+    display_name: "OIDC"
+    run_on:
+      - ubuntu2204-large
+    expansions:
+      GO_DIST: "/opt/golang/go1.20"
+    tasks:
+      - name: testoidc_task_group
+        batchtime: 20160 # Use a batchtime of 14 days as suggested by the CSFLE test README
+      - name: testazureoidc_task_group
+        batchtime: 20160 # Use a batchtime of 14 days as suggested by the CSFLE test README
