@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"go.mongodb.org/mongo-driver/internal/assert"
+	"go.mongodb.org/mongo-driver/internal/require"
 	"go.mongodb.org/mongo-driver/mongo/address"
 	"go.mongodb.org/mongo-driver/mongo/description"
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
@@ -427,7 +428,7 @@ func TestConnection(t *testing.T) {
 
 					want := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A}
 					err := conn.writeWireMessage(context.Background(), want)
-					noerr(t, err)
+					require.NoError(t, err)
 					got := tnc.buf
 					if !cmp.Equal(got, want) {
 						t.Errorf("writeWireMessage did not write the proper bytes. got %v; want %v", got, want)
@@ -546,6 +547,23 @@ func TestConnection(t *testing.T) {
 					}
 					listener.assertCalledOnce(t)
 				})
+				t.Run("size too small errors", func(t *testing.T) {
+					err := errors.New("malformed message length: 3")
+					tnc := &testNetConn{readerr: err, buf: []byte{0x03, 0x00, 0x00, 0x00}}
+					conn := &connection{id: "foobar", nc: tnc, state: connConnected}
+					listener := newTestCancellationListener(false)
+					conn.cancellationListener = listener
+
+					want := ConnectionError{ConnectionID: "foobar", Wrapped: err, message: err.Error()}
+					_, got := conn.readWireMessage(context.Background())
+					if !cmp.Equal(got, want, cmp.Comparer(compareErrors)) {
+						t.Errorf("errors do not match. got %v; want %v", got, want)
+					}
+					if !tnc.closed {
+						t.Errorf("failed to closeConnection net.Conn after error writing bytes.")
+					}
+					listener.assertCalledOnce(t)
+				})
 				t.Run("full message read errors", func(t *testing.T) {
 					err := errors.New("Read error")
 					tnc := &testNetConn{readerr: err, buf: []byte{0x11, 0x00, 0x00, 0x00}}
@@ -607,7 +625,7 @@ func TestConnection(t *testing.T) {
 					conn.cancellationListener = listener
 
 					got, err := conn.readWireMessage(context.Background())
-					noerr(t, err)
+					require.NoError(t, err)
 					if !cmp.Equal(got, want) {
 						t.Errorf("did not read full wire message. got %v; want %v", got, want)
 					}
@@ -783,7 +801,7 @@ func TestConnection(t *testing.T) {
 			makeMultipleConnections := func(t *testing.T, numConns int) (*pool, []*Connection, func()) {
 				t.Helper()
 
-				addr := bootstrapConnections(t, numConns, func(nc net.Conn) {})
+				addr := bootstrapConnections(t, numConns, func(net.Conn) {})
 				pool := newPool(poolConfig{
 					Address: address.Address(addr.String()),
 				})
@@ -1233,4 +1251,86 @@ func (tcl *testCancellationListener) StopListening() bool {
 func (tcl *testCancellationListener) assertCalledOnce(t *testing.T) {
 	assert.Equal(t, 1, tcl.numListen, "expected Listen to be called once, got %d", tcl.numListen)
 	assert.Equal(t, 1, tcl.numStopListening, "expected StopListening to be called once, got %d", tcl.numListen)
+}
+
+func TestConnection_IsAlive(t *testing.T) {
+	t.Parallel()
+
+	t.Run("uninitialized", func(t *testing.T) {
+		t.Parallel()
+
+		conn := newConnection("")
+		assert.False(t,
+			conn.isAlive(),
+			"expected isAlive for an uninitialized connection to always return false")
+	})
+
+	t.Run("connection open", func(t *testing.T) {
+		t.Parallel()
+
+		cleanup := make(chan struct{})
+		defer close(cleanup)
+		addr := bootstrapConnections(t, 1, func(nc net.Conn) {
+			// Keep the connection open until the end of the test.
+			<-cleanup
+			_ = nc.Close()
+		})
+
+		conn := newConnection(address.Address(addr.String()))
+		err := conn.connect(context.Background())
+		require.NoError(t, err)
+
+		conn.idleStart.Store(time.Now().Add(-11 * time.Second))
+		assert.True(t,
+			conn.isAlive(),
+			"expected isAlive for an open connection to return true")
+	})
+
+	t.Run("connection closed", func(t *testing.T) {
+		t.Parallel()
+
+		conns := make(chan net.Conn)
+		addr := bootstrapConnections(t, 1, func(nc net.Conn) {
+			conns <- nc
+		})
+
+		conn := newConnection(address.Address(addr.String()))
+		err := conn.connect(context.Background())
+		require.NoError(t, err)
+
+		// Close the connection before calling isAlive.
+		nc := <-conns
+		err = nc.Close()
+		require.NoError(t, err)
+
+		conn.idleStart.Store(time.Now().Add(-11 * time.Second))
+		assert.False(t,
+			conn.isAlive(),
+			"expected isAlive for a closed connection to return false")
+	})
+
+	t.Run("connection reads data", func(t *testing.T) {
+		t.Parallel()
+
+		cleanup := make(chan struct{})
+		defer close(cleanup)
+		addr := bootstrapConnections(t, 1, func(nc net.Conn) {
+			// Write some data to the connection before calling isAlive.
+			_, err := nc.Write([]byte{5, 0, 0, 0, 0})
+			require.NoError(t, err)
+
+			// Keep the connection open until the end of the test.
+			<-cleanup
+			_ = nc.Close()
+		})
+
+		conn := newConnection(address.Address(addr.String()))
+		err := conn.connect(context.Background())
+		require.NoError(t, err)
+
+		conn.idleStart.Store(time.Now().Add(-11 * time.Second))
+		assert.False(t,
+			conn.isAlive(),
+			"expected isAlive for an open connection that reads data to return false")
+	})
 }
