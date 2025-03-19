@@ -42,6 +42,8 @@ type structTags struct {
 	Truncate  bool
 	Inline    bool
 	Skip      bool
+
+	OmitEncode bool
 }
 
 // DefaultStructTagParser is the StructTagParser used by the StructCodec by default.
@@ -114,6 +116,8 @@ func parseTags(key string, tag string) (*structTags, error) {
 			st.Truncate = true
 		case "inline":
 			st.Inline = true
+		case "omitencode":
+			st.OmitEncode = true
 		}
 	}
 
