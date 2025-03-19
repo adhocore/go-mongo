@@ -642,6 +642,10 @@ func (c *ClientOptions) ApplyURI(uri string) *ClientOptions {
 	return c
 }
 
+func (c *ClientOptions) Database() string {
+	return c.connString.Database
+}
+
 // SetAppName specifies an application name that is sent to the server when creating new connections. It is used by the
 // server to log connection and profiling information (e.g. slow query logs). This can also be set through the "appName"
 // URI option (e.g "appName=example_application"). The default is empty, meaning no app name will be sent.
