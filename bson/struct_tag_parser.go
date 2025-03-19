@@ -42,6 +42,8 @@ type structTags struct {
 	Truncate  bool
 	Inline    bool
 	Skip      bool
+
+	OmitEncode bool
 }
 
 // DefaultStructTagParser is the StructTagParser used by the StructCodec by default.

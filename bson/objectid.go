@@ -67,7 +67,7 @@ func (id ObjectID) Hex() string {
 }
 
 func (id ObjectID) String() string {
-	return `ObjectID("` + id.Hex() + `")`
+	return id.Hex()
 }
 
 // IsZero returns true if id is the empty ObjectID.

@@ -109,6 +109,9 @@ func (sc *structCodec) EncodeValue(ec EncodeContext, vw ValueWriter, val reflect
 	}
 	var rv reflect.Value
 	for _, desc := range sd.fl {
+		if desc.omitEncode {
+			continue
+		}
 		if desc.inline == nil {
 			rv = val.Field(desc.idx)
 		} else {
@@ -409,6 +412,8 @@ type fieldDescription struct {
 	inline    []int
 	encoder   ValueEncoder
 	decoder   ValueDecoder
+
+	omitEncode bool
 }
 
 type byIndex []fieldDescription
@@ -519,6 +524,7 @@ func (sc *structCodec) describeStructSlow(
 		description.omitEmpty = stags.OmitEmpty
 		description.minSize = stags.MinSize
 		description.truncate = stags.Truncate
+		description.omitEncode = stags.OmitEncode
 
 		if stags.Inline {
 			sd.inline = true
