@@ -19,14 +19,18 @@ type changeStreamDeployment struct {
 	topologyKind description.TopologyKind
 	server       driver.Server
 	conn         *mnet.Connection
+
+	reset func() error
+	close func() error
 }
 
-var _ driver.Deployment = (*changeStreamDeployment)(nil)
-var _ driver.Server = (*changeStreamDeployment)(nil)
-var _ driver.ErrorProcessor = (*changeStreamDeployment)(nil)
+var (
+	_ driver.Deployment     = (*changeStreamDeployment)(nil)
+	_ driver.Server         = (*changeStreamDeployment)(nil)
+	_ driver.ErrorProcessor = (*changeStreamDeployment)(nil)
+)
 
 func (c *changeStreamDeployment) SelectServer(context.Context, description.ServerSelector) (driver.Server, error) {
-
 	return c, nil
 }
 
@@ -35,7 +39,11 @@ func (c *changeStreamDeployment) Kind() description.TopologyKind {
 }
 
 func (c *changeStreamDeployment) Connection(context.Context) (*mnet.Connection, error) {
-	return c.conn, nil
+	var err error
+	if c.conn == nil || c.conn.Closed() {
+		err = c.reset()
+	}
+	return c.conn, err
 }
 
 func (c *changeStreamDeployment) RTTMonitor() driver.RTTMonitor {

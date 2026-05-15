@@ -429,22 +429,22 @@ func stringifyEventsForClient(client *clientEntity) string {
 
 	str.WriteString("\n\nStarted Events\n\n")
 	for _, evt := range client.startedEvents() {
-		str.WriteString(fmt.Sprintf("[%s] %s\n", evt.ConnectionID, evt.Command))
+		fmt.Fprintf(str, "[%s] %s\n", evt.ConnectionID, evt.Command)
 	}
 
 	str.WriteString("\nSucceeded Events\n\n")
 	for _, evt := range client.succeededEvents() {
-		str.WriteString(fmt.Sprintf("[%s] CommandName: %s, Reply: %s\n", evt.ConnectionID, evt.CommandName, evt.Reply))
+		fmt.Fprintf(str, "[%s] CommandName: %s, Reply: %s\n", evt.ConnectionID, evt.CommandName, evt.Reply)
 	}
 
 	str.WriteString("\nFailed Events\n\n")
 	for _, evt := range client.failedEvents() {
-		str.WriteString(fmt.Sprintf("[%s] CommandName: %s, Failure: %s\n", evt.ConnectionID, evt.CommandName, evt.Failure))
+		fmt.Fprintf(str, "[%s] CommandName: %s, Failure: %s\n", evt.ConnectionID, evt.CommandName, evt.Failure)
 	}
 
 	str.WriteString("\nPool Events\n\n")
 	for _, evt := range client.poolEvents() {
-		str.WriteString(fmt.Sprintf("[%s] Event Type: %q\n", evt.Address, evt.Type))
+		fmt.Fprintf(str, "[%s] Event Type: %q\n", evt.Address, evt.Type)
 	}
 
 	return str.String()
@@ -557,30 +557,27 @@ func verifySDAMEvents(client *clientEntity, expectedEvents *expectedEvents) erro
 				return newEventVerificationError(idx, client, "failed to get next server description changed event: %v", err.Error())
 			}
 
-			prevDesc := evt.ServerDescriptionChangedEvent.NewDescription
+			// Only verify description types when explicitly specified in the test.
+			// An empty `serverDescriptionChangedEvent{}` matches any description change.
 
-			var wantPrevDesc string
+			prevDesc := evt.ServerDescriptionChangedEvent.PreviousDescription
 			if prevDesc != nil && prevDesc.Type != nil {
-				wantPrevDesc = *prevDesc.Type
+				wantPrevDesc := *prevDesc.Type
+				gotPrevDesc := got.PreviousDescription.Kind
+				if gotPrevDesc != wantPrevDesc {
+					return newEventVerificationError(idx, client,
+						"expected previous server description %q, got %q", wantPrevDesc, gotPrevDesc)
+				}
 			}
 
-			gotPrevDesc := got.PreviousDescription.Kind
-			if gotPrevDesc != wantPrevDesc {
-				return newEventVerificationError(idx, client,
-					"expected previous server description %q, got %q", wantPrevDesc, gotPrevDesc)
-			}
-
-			newDesc := evt.ServerDescriptionChangedEvent.PreviousDescription
-
-			var wantNewDesc string
+			newDesc := evt.ServerDescriptionChangedEvent.NewDescription
 			if newDesc != nil && newDesc.Type != nil {
-				wantNewDesc = *newDesc.Type
-			}
-
-			gotNewDesc := got.NewDescription.Kind
-			if gotNewDesc != wantNewDesc {
-				return newEventVerificationError(idx, client,
-					"expected new server description %q, got %q", wantNewDesc, gotNewDesc)
+				wantNewDesc := *newDesc.Type
+				gotNewDesc := got.NewDescription.Kind
+				if gotNewDesc != wantNewDesc {
+					return newEventVerificationError(idx, client,
+						"expected new server description %q, got %q", wantNewDesc, gotNewDesc)
+				}
 			}
 		case evt.ServerHeartbeatStartedEvent != nil:
 			var got *event.ServerHeartbeatStartedEvent
