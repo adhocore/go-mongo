@@ -28,9 +28,37 @@ const (
 	database = "admin"
 )
 
+// errWriteFailed signals that a single write operation failed. processResponse
+// returns it so execute can distinguish a write failure (which is not a
+// top-level error) from a top-level error. It is internal and must never be
+// returned to users.
+var errWriteFailed = errors.New("write operation failed")
+
 type clientBulkWritePair struct {
 	namespace string
 	model     any
+
+	// collectionUUID pins this write to a specific collection instance. It is
+	// set only through the "collectionUUIDs" internal option and is nil for
+	// writes that do not use it. The bytes are not validated here; the server
+	// rejects a value that is not a 16-byte UUID.
+	collectionUUID []byte
+}
+
+// nsKey identifies an nsInfo entry. Two writes share an entry only when they
+// agree on both the namespace and the collection UUID, so the same namespace
+// can appear more than once in nsInfo with different UUIDs.
+type nsKey struct {
+	ns string
+
+	// hasUUID distinguishes an unset UUID from an empty one, which string(uuid)
+	// does not.
+	hasUUID bool
+
+	// uuid is the UTF-8 string representation of the UUID bytes (i.e.
+	// string(uuid)). A string is used here because []byte is not comparable so
+	// cannot be used as a map key. The value is never used except as a map key.
+	uuid string
 }
 
 type clientBulkWrite struct {
@@ -93,24 +121,39 @@ func (bw *clientBulkWrite) execute(ctx context.Context) error {
 		Name:                      driverutil.BulkWriteOp,
 		SendAfterClusterTime:      true,
 	}.Execute(ctx)
-	var exception *ClientBulkWriteException
+	var de driver.Error
+	isDriverErr := errors.As(err, &de)
 
-	var ce CommandError
-	if errors.As(err, &ce) {
+	topLevelErr := hasTopLevelErr(err)
+
+	var exception *ClientBulkWriteException
+	if len(batches.writeConcernErrors) > 0 || len(batches.writeErrors) > 0 ||
+		(topLevelErr && batches.resultsObserved) {
 		exception = &ClientBulkWriteException{
-			WriteError: &WriteError{
-				Code:    int(ce.Code),
-				Message: ce.Message,
-				Raw:     ce.Raw,
-			},
+			WriteConcernErrors: batches.writeConcernErrors,
+			WriteErrors:        batches.writeErrors,
 		}
-	}
-	if len(batches.writeConcernErrors) > 0 || len(batches.writeErrors) > 0 {
-		if exception == nil {
-			exception = new(ClientBulkWriteException)
+		if topLevelErr {
+			// Retain the error so that errors.Is and errors.As still see it.
+			// Convert it first: the raw error from Operation.Execute is a
+			// driver.Error, and wrapErrors is what turns that into the public
+			// mongo.CommandError. Storing it unconverted would leave the chain
+			// terminating at an internal type, so errors.As for CommandError,
+			// ServerError predicates such as IsDuplicateKeyError, and IsTimeout
+			// for a maxTimeMS-expired error would all fail.
+			exception.wrapped = wrapErrors(err)
+
+			if isDriverErr {
+				exception.WriteError = &WriteError{
+					Code:    int(de.Code),
+					Message: de.Message,
+					Raw:     bson.Raw(de.Raw),
+				}
+			} else {
+				// A client-side error has neither a code nor a server reply.
+				exception.WriteError = &WriteError{Message: err.Error()}
+			}
 		}
-		exception.WriteConcernErrors = batches.writeConcernErrors
-		exception.WriteErrors = batches.writeErrors
 	}
 	if exception != nil {
 		var hasSuccess bool
@@ -125,7 +168,27 @@ func (bw *clientBulkWrite) execute(ctx context.Context) error {
 		}
 		return *exception
 	}
+	if errors.Is(err, errWriteFailed) {
+		return nil
+	}
 	return err
+}
+
+// hasTopLevelErr reports whether err is a top-level error: any error that occurs
+// that is not the result of a single write operation failing or a write concern
+// error. An unacknowledged write is not a failure.
+func hasTopLevelErr(err error) bool {
+	return err != nil &&
+		!errors.Is(err, errWriteFailed) &&
+		!isWriteCommandErr(err) &&
+		!errors.Is(err, driver.ErrUnacknowledgedWrite)
+}
+
+// isWriteCommandErr reports whether err carries write errors and/or a write
+// concern error, neither of which the spec defines as a top-level error.
+func isWriteCommandErr(err error) bool {
+	var writeCmdErr driver.WriteCommandError
+	return errors.As(err, &writeCmdErr)
 }
 
 func (bw *clientBulkWrite) newCommand() func([]byte, description.SelectedServer) ([]byte, error) {
@@ -155,14 +218,7 @@ func (bw *clientBulkWrite) newCommand() func([]byte, description.SelectedServer)
 		if bw.rawData != nil && desc.WireVersion != nil && driverutil.VersionRangeIncludes(*desc.WireVersion, 27) {
 			dst = bsoncore.AppendBooleanElement(dst, "rawData", *bw.rawData)
 		}
-		if len(bw.additionalCmd) > 0 {
-			doc, err := bson.Marshal(bw.additionalCmd)
-			if err != nil {
-				return nil, err
-			}
-			dst = append(dst, doc[4:len(doc)-1]...)
-		}
-		return dst, nil
+		return appendAdditionalCmd(dst, bw.additionalCmd)
 	}
 }
 
@@ -212,6 +268,8 @@ type modelBatches struct {
 	result             *ClientBulkWriteResult
 	writeConcernErrors []WriteConcernError
 	writeErrors        map[int]WriteError
+
+	resultsObserved bool
 }
 
 var _ driver.OperationBatches = &modelBatches{}
@@ -282,14 +340,19 @@ func (mb *modelBatches) appendBatches(fn functionSet, dst []byte, maxCount, tota
 	mb.cursorHandlers = mb.cursorHandlers[:0]
 	mb.newIDMap = make(map[int]any)
 
-	nsMap := make(map[string]int)
-	getNsIndex := func(namespace string) (int, bool) {
-		v, ok := nsMap[namespace]
+	nsMap := make(map[nsKey]int)
+	getNsIndex := func(namespace string, uuid []byte) (int, bool) {
+		key := nsKey{
+			ns:      namespace,
+			hasUUID: uuid != nil,
+			uuid:    string(uuid),
+		}
+		v, ok := nsMap[key]
 		if ok {
 			return v, ok
 		}
 		nsIdx := len(nsMap)
-		nsMap[namespace] = nsIdx
+		nsMap[key] = nsIdx
 		return nsIdx, ok
 	}
 
@@ -308,7 +371,8 @@ func (mb *modelBatches) appendBatches(fn functionSet, dst []byte, maxCount, tota
 		}
 
 		ns := mb.writePairs[i].namespace
-		nsIdx, exists := getNsIndex(ns)
+		uuid := mb.writePairs[i].collectionUUID
+		nsIdx, exists := getNsIndex(ns, uuid)
 
 		var doc bsoncore.Document
 		var err error
@@ -391,21 +455,31 @@ func (mb *modelBatches) appendBatches(fn functionSet, dst []byte, maxCount, tota
 		if err != nil {
 			return 0, nil, err
 		}
-		length := len(doc)
+		var nsDoc bsoncore.Document
 		if !exists {
-			length += len(ns)
+			// Document framing (5 bytes) plus the "ns" string element (9 bytes
+			// plus the namespace).
+			nsDocLen := 14 + len(ns)
+			if uuid != nil {
+				// The "collectionUUID" binary element (21 bytes plus the UUID).
+				nsDocLen += 21 + len(uuid)
+			}
+			var idx int32
+			idx, nsDoc = bsoncore.AppendDocumentStart(make([]byte, 0, nsDocLen))
+			nsDoc = bsoncore.AppendStringElement(nsDoc, "ns", ns)
+			if uuid != nil {
+				nsDoc = bsoncore.AppendBinaryElement(nsDoc, "collectionUUID", bson.TypeBinaryUUID, uuid)
+			}
+			nsDoc, _ = bsoncore.AppendDocumentEnd(nsDoc, idx)
 		}
-		size += length
+		size += len(doc) + len(nsDoc)
 		if size >= totalSize {
 			break
 		}
 
 		dst = fn.appendDocument(dst, strconv.Itoa(n), doc)
-		if !exists {
-			idx, doc := bsoncore.AppendDocumentStart(nil)
-			doc = bsoncore.AppendStringElement(doc, "ns", ns)
-			doc, _ = bsoncore.AppendDocumentEnd(doc, idx)
-			nsDst = fn.appendDocument(nsDst, strconv.Itoa(n), doc)
+		if nsDoc != nil {
+			nsDst = fn.appendDocument(nsDst, strconv.Itoa(n), nsDoc)
 		}
 		n++
 	}
@@ -452,17 +526,12 @@ func (mb *modelBatches) processResponse(ctx context.Context, resp bsoncore.Docum
 		return err
 	}
 	if !res.Ok {
-		return ClientBulkWriteException{
-			WriteError: &WriteError{
-				Code:    int(res.Code),
-				Message: res.Errmsg,
-				Raw:     bson.Raw(resp),
-			},
-			WriteConcernErrors: mb.writeConcernErrors,
-			WriteErrors:        mb.writeErrors,
-			PartialResult:      mb.result,
-		}
+		// Return a plain error so it can never be mistaken for a top-level error
+		// by hasTopLevelErr.
+		return fmt.Errorf("bulkWrite command failed: %s", res.Errmsg)
 	}
+
+	mb.resultsObserved = true
 
 	if mb.result.Acknowledged {
 		mb.result.DeletedCount += int64(res.NDeleted)
@@ -478,7 +547,8 @@ func (mb *modelBatches) processResponse(ctx context.Context, resp bsoncore.Docum
 		return err
 	}
 	var bCursor *driver.BatchCursor
-	bCursor, err = driver.NewBatchCursor(cursorRes, mb.session, mb.client.clock,
+	bCursor, err = driver.NewBatchCursor(
+		cursorRes, mb.session, mb.client.clock,
 		driver.CursorOptions{
 			CommandMonitor:        mb.client.monitor,
 			Crypt:                 mb.client.cryptFLE,
@@ -517,12 +587,9 @@ func (mb *modelBatches) processResponse(ctx context.Context, resp bsoncore.Docum
 	if err != nil {
 		return err
 	}
-	if mb.ordered && (writeCmdErr.WriteConcernError != nil || !ok || !res.Ok || res.NErrors > 0) {
-		return ClientBulkWriteException{
-			WriteConcernErrors: mb.writeConcernErrors,
-			WriteErrors:        mb.writeErrors,
-			PartialResult:      mb.result,
-		}
+	if mb.ordered && (!ok || res.NErrors > 0) {
+		// A single write operation failed. This is not a top-level error.
+		return errWriteFailed
 	}
 	return nil
 }
